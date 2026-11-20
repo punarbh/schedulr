@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Schedulr — University Timetable Clash Resolver</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🗓️</text></svg>">
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              yellow: '#facc15',
+              yellowHover: '#eab308',
+              yellowLight: '#fef08a',
+              dark: '#09090b',
+              surface: '#121215',
+              card: '#18181b',
+              cardBorder: '#27272a',
+              muted: '#a1a1aa',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- React 18 & ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <!-- Babel Standalone for JSX -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    @media print {
+      body * {
+        visibility: hidden;
+      }
+      #printable-timetable, #printable-timetable * {
+        visibility: visible;
+        color: #000 !important;
+        background: #fff !important;
+      }
+      #printable-timetable {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+      }
+      .no-print {
+        display: none !important;
+      }
+    }
+    .custom-scroll::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .custom-scroll::-webkit-scrollbar-track {
+      background: #18181b;
+    }
+    .custom-scroll::-webkit-scrollbar-thumb {
+      background: #3f3f46;
+      border-radius: 3px;
+    }
+    .custom-scroll::-webkit-scrollbar-thumb:hover {
+      background: #facc15;
+    }
+  </style>
+</head>
+<body class="bg-[#09090b] text-white antialiased font-sans min-h-screen selection:bg-yellow-400 selection:text-black">
+  <div id="root"></div>
+
+  <!-- Main React Application Script -->
+  <script type="text/babel" data-type="module" src="app.js"></script>
+</body>
+</html>
