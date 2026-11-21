@@ -4,3 +4,8 @@ pydantic
 ortools
 pandas
 numpy
+sqlalchemy
+psycopg2-binary
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart

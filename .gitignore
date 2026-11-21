@@ -47,3 +47,10 @@ dist-ssr/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Databases & local scratch
+*.db
+*.sqlite3
+schedulr.db
+scratch/
+

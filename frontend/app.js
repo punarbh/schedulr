@@ -37,6 +37,25 @@ function refreshIcons() {
   }, 50);
 }
 
+// Authenticated API request helper with automatic Bearer token injection
+async function apiFetch(endpoint, options = {}) {
+  const token = sessionStorage.getItem("schedulr_auth_token");
+  const headers = {
+    ...(options.headers || {})
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+  const url = endpoint.startsWith("http") ? endpoint : `${API_BASE}${endpoint}`;
+  const res = await fetch(url, { ...options, headers });
+  if (res.status === 401 && !url.includes("/auth/login") && !url.includes("/auth/signup")) {
+    sessionStorage.removeItem("schedulr_auth_token");
+    sessionStorage.removeItem("schedulr_user");
+    window.dispatchEvent(new CustomEvent("schedulr_session_expired"));
+  }
+  return res;
+}
+
 // Icon Wrapper Component
 function Icon({ name, className = "w-5 h-5", size = 20 }) {
   return <i data-lucide={name} className={className} style={{ width: size, height: size }}></i>;
@@ -44,6 +63,27 @@ function Icon({ name, className = "w-5 h-5", size = 20 }) {
 
 // Main App Component
 function App() {
+  // Authentication & RBAC states
+  const [authToken, setAuthToken] = useState(() => {
+    try {
+      return sessionStorage.getItem("schedulr_auth_token");
+    } catch {
+      return null;
+    }
+  });
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem("schedulr_user");
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [authChecking, setAuthChecking] = useState(true);
+  const [facultySchedule, setFacultySchedule] = useState(null);
+  const [studentSchedule, setStudentSchedule] = useState(null);
+  const [roleLoading, setRoleLoading] = useState(false);
+
   const [activeTab, setActiveTab] = useState("landing");
   const [dataset, setDataset] = useState(null);
   const [scheduleResponse, setScheduleResponse] = useState(null);
@@ -84,10 +124,115 @@ function App() {
   // Backlog resolution banner state
   const [backlogBanner, setBacklogBanner] = useState(null);
 
-  // Initial Load & Health Check
+  // Initial Load & Session Verification
   useEffect(() => {
-    checkHealthAndLoad();
+    checkAuthSession();
+    const handleExpired = () => {
+      setAuthToken(null);
+      setCurrentUser(null);
+      setFacultySchedule(null);
+      setStudentSchedule(null);
+    };
+    window.addEventListener("schedulr_session_expired", handleExpired);
+    return () => window.removeEventListener("schedulr_session_expired", handleExpired);
   }, []);
+
+  async function checkAuthSession() {
+    const token = sessionStorage.getItem("schedulr_auth_token");
+    if (!token) {
+      setAuthChecking(false);
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/auth/me`, {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const user = await res.json();
+        setCurrentUser(user);
+        sessionStorage.setItem("schedulr_user", JSON.stringify(user));
+        if (user.role === "FACULTY") {
+          setActiveTab("faculty_timetable");
+          await loadFacultyData(token);
+        } else if (user.role === "STUDENT") {
+          setActiveTab("student_timetable");
+          await loadStudentData(token);
+        } else {
+          setActiveTab("landing");
+          await checkHealthAndLoad();
+        }
+      } else {
+        sessionStorage.removeItem("schedulr_auth_token");
+        sessionStorage.removeItem("schedulr_user");
+        setAuthToken(null);
+        setCurrentUser(null);
+      }
+    } catch (e) {
+      console.warn("Auth check failed:", e);
+    } finally {
+      setAuthChecking(false);
+    }
+  }
+
+  async function loadFacultyData(token = authToken) {
+    setRoleLoading(true);
+    try {
+      const res = await apiFetch("/faculty/me/schedule");
+      if (res.ok) {
+        const data = await res.json();
+        setFacultySchedule(data);
+      }
+    } catch (err) {
+      console.error("Failed to load faculty schedule:", err);
+    } finally {
+      setRoleLoading(false);
+    }
+  }
+
+  async function loadStudentData(token = authToken) {
+    setRoleLoading(true);
+    try {
+      const res = await apiFetch("/student/me/schedule");
+      if (res.ok) {
+        const data = await res.json();
+        setStudentSchedule(data);
+      }
+    } catch (err) {
+      console.error("Failed to load student schedule:", err);
+    } finally {
+      setRoleLoading(false);
+    }
+  }
+
+  async function handleLoginSuccess(token, user) {
+    sessionStorage.setItem("schedulr_auth_token", token);
+    sessionStorage.setItem("schedulr_user", JSON.stringify(user));
+    setAuthToken(token);
+    setCurrentUser(user);
+    if (user.role === "FACULTY") {
+      setActiveTab("faculty_timetable");
+      await loadFacultyData(token);
+    } else if (user.role === "STUDENT") {
+      setActiveTab("student_timetable");
+      await loadStudentData(token);
+    } else {
+      setActiveTab("landing");
+      await checkHealthAndLoad();
+    }
+  }
+
+  async function handleLogout() {
+    try {
+      await apiFetch("/auth/logout", { method: "POST" });
+    } catch {}
+    sessionStorage.removeItem("schedulr_auth_token");
+    sessionStorage.removeItem("schedulr_user");
+    setAuthToken(null);
+    setCurrentUser(null);
+    setFacultySchedule(null);
+    setStudentSchedule(null);
+    setActiveTab("landing");
+  }
 
   useEffect(() => {
     refreshIcons();
@@ -119,7 +264,7 @@ function App() {
     setIsSolving(true);
     try {
       if (type === "backlog-demo") {
-        const res = await fetch(`${API_BASE}/scenarios/backlog-demo`);
+        const res = await apiFetch("/scenarios/backlog-demo");
         if (res.ok) {
           const pack = await res.json();
           setDataset(pack.dataset);
@@ -137,7 +282,7 @@ function App() {
       if (type === "impossible") endpoint = `${API_BASE}/scenarios/impossible`;
       if (type === "large") endpoint = `${API_BASE}/scenarios/large`;
 
-      const res = await fetch(endpoint);
+      const res = await apiFetch(endpoint);
       if (res.ok) {
         const data = await res.json();
         setDataset(data);
@@ -156,7 +301,7 @@ function App() {
 
   async function handleUpdateEnrolmentStatus(enrolmentId, newStatus, notes = "") {
     try {
-      const res = await fetch(`${API_BASE}/enrolments/update-status`, {
+      const res = await apiFetch("/enrolments/update-status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -259,7 +404,7 @@ function App() {
         ...currentData,
         preferences: preferences
       };
-      const res = await fetch(`${API_BASE}/solve`, {
+      const res = await apiFetch("/solve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -285,7 +430,7 @@ function App() {
         remedy_type: remedyType,
         parameters: customParams
       };
-      const res = await fetch(`${API_BASE}/simulate-what-if`, {
+      const res = await apiFetch("/simulate-what-if", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -332,6 +477,28 @@ function App() {
     document.body.removeChild(link);
   }
 
+  // Unauthenticated and loading guards
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-[#09090b] flex flex-col items-center justify-center text-white space-y-4">
+        <div className="w-12 h-12 rounded-2xl bg-yellow-400 text-black flex items-center justify-center font-black animate-pulse shadow-lg shadow-yellow-500/20">
+          <Icon name="calendar-check" className="w-7 h-7 stroke-[2.5]" />
+        </div>
+        <p className="text-zinc-400 text-sm font-medium tracking-wide">Initializing Schedulr Security Session...</p>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <AuthScreen
+        onLoginSuccess={handleLoginSuccess}
+        apiOnline={apiOnline}
+        engineInfo={engineInfo}
+      />
+    );
+  }
+
   return (
     <div className="flex flex-col min-h-screen bg-[#09090b] text-white">
       {/* Top Main Navigation Bar */}
@@ -340,7 +507,11 @@ function App() {
           <div className="flex items-center space-x-6">
             <div 
               className="flex items-center space-x-3 cursor-pointer group"
-              onClick={() => setActiveTab("landing")}
+              onClick={() => {
+                if (currentUser?.role === 'FACULTY') setActiveTab('faculty_timetable');
+                else if (currentUser?.role === 'STUDENT') setActiveTab('student_timetable');
+                else setActiveTab('landing');
+              }}
             >
               <div className="w-10 h-10 rounded-xl bg-yellow-400 text-black flex items-center justify-center font-black shadow-lg shadow-yellow-500/25 group-hover:bg-yellow-300 transition transform group-hover:scale-105 duration-200">
                 <Icon name="calendar-check" className="w-6 h-6 stroke-[2.5]" />
@@ -353,9 +524,9 @@ function App() {
               </div>
             </div>
 
-            {/* Navigation Links */}
+            {/* Navigation Links based on User Role */}
             <nav className="hidden md:flex items-center space-x-1">
-              {[
+              {currentUser?.role === "ADMIN" && [
                 { id: "landing", label: "Overview" },
                 { id: "dashboard", label: "Dashboard" },
                 { id: "datamanager", label: "Data Manager" },
@@ -377,12 +548,55 @@ function App() {
                   {tab.label}
                   {tab.id === 'backlogs' && dataset?.enrolments && (
                     <span className="ml-1.5 px-1.5 py-0.2 bg-yellow-400 text-black text-[10px] rounded-full font-black">
-                      {dataset.enrolments.filter(e => e.enrolment_type === 'Backlog' && e.status === 'Active').length}
+                      {dataset.enrolments.filter(e => (e.enrolment_type === 'Backlog' || e.enrolmentType === 'Backlog') && e.status === 'Active').length}
                     </span>
                   )}
                   {tab.id === 'conflictlab' && scheduleResponse && !scheduleResponse.is_feasible && (
                     <span className="ml-1.5 px-1.5 py-0.2 bg-rose-500 text-white text-[10px] rounded-full font-black animate-pulse">
-                      {scheduleResponse.conflicts.length}
+                      {scheduleResponse.conflicts?.length || 1}
+                    </span>
+                  )}
+                </button>
+              ))}
+
+              {currentUser?.role === "FACULTY" && [
+                { id: "faculty_timetable", label: "My Timetable" },
+                { id: "faculty_sections", label: "My Sections" },
+                { id: "faculty_availability", label: "My Availability" },
+                { id: "faculty_insights", label: "Teaching Insights" }
+              ].map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`px-3 py-2 rounded-lg text-sm font-semibold transition ${
+                    activeTab === tab.id
+                      ? 'bg-zinc-800 text-yellow-400 border border-yellow-400/30 shadow-xs'
+                      : 'text-zinc-400 hover:text-white hover:bg-zinc-900/60'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+
+              {currentUser?.role === "STUDENT" && [
+                { id: "student_timetable", label: "My Timetable" },
+                { id: "student_courses", label: "My Courses" },
+                { id: "student_backlogs", label: "My Backlogs & Freed Slots" },
+                { id: "student_profile", label: "Student Profile" }
+              ].map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`px-3 py-2 rounded-lg text-sm font-semibold transition ${
+                    activeTab === tab.id
+                      ? 'bg-zinc-800 text-yellow-400 border border-yellow-400/30 shadow-xs'
+                      : 'text-zinc-400 hover:text-white hover:bg-zinc-900/60'
+                  }`}
+                >
+                  {tab.label}
+                  {tab.id === 'student_backlogs' && studentSchedule?.freed_slots?.length > 0 && (
+                    <span className="ml-1.5 px-1.5 py-0.2 bg-emerald-400 text-black text-[10px] rounded-full font-black">
+                      {studentSchedule.freed_slots.length} Freed
                     </span>
                   )}
                 </button>
@@ -397,34 +611,91 @@ function App() {
               <span className="font-mono">{engineInfo}</span>
             </div>
 
-            {/* Quick Run CTA */}
-            <button
-              onClick={() => runSolver()}
-              disabled={isSolving || !dataset}
-              className={`flex items-center space-x-2 px-4 py-2 rounded-lg text-sm font-black shadow-lg transition ${
-                isSolving
-                  ? 'bg-zinc-700 text-zinc-400 cursor-not-allowed'
-                  : 'bg-yellow-400 hover:bg-yellow-300 text-black active:scale-95 shadow-yellow-500/20'
-              }`}
-            >
-              {isSolving ? (
-                <>
-                  <Icon name="loader-2" className="animate-spin w-4 h-4 text-black" />
-                  <span>Solving...</span>
-                </>
-              ) : (
-                <>
-                  <Icon name="sparkles" className="w-4 h-4 text-black" />
-                  <span>Generate Timetable</span>
-                </>
-              )}
-            </button>
+            {/* Quick Run CTA for ADMIN */}
+            {currentUser?.role === "ADMIN" && (
+              <button
+                onClick={() => runSolver()}
+                disabled={isSolving || !dataset}
+                className={`flex items-center space-x-2 px-3.5 py-2 rounded-lg text-xs font-black shadow-lg transition ${
+                  isSolving
+                    ? 'bg-zinc-700 text-zinc-400 cursor-not-allowed'
+                    : 'bg-yellow-400 hover:bg-yellow-300 text-black active:scale-95 shadow-yellow-500/20'
+                }`}
+              >
+                {isSolving ? (
+                  <>
+                    <Icon name="loader-2" className="animate-spin w-3.5 h-3.5 text-black" />
+                    <span>Solving...</span>
+                  </>
+                ) : (
+                  <>
+                    <Icon name="sparkles" className="w-3.5 h-3.5 text-black" />
+                    <span>Generate Timetable</span>
+                  </>
+                )}
+              </button>
+            )}
+
+            {/* User Profile Summary & Sign Out */}
+            <div className="flex items-center space-x-3 pl-2 border-l border-zinc-800">
+              <div className="flex items-center space-x-2">
+                <div className="w-8 h-8 rounded-full bg-zinc-800 border border-zinc-700 flex items-center justify-center text-xs font-black text-yellow-400">
+                  {currentUser.full_name ? currentUser.full_name.charAt(0).toUpperCase() : "U"}
+                </div>
+                <div className="hidden sm:block text-left">
+                  <div className="text-xs font-bold text-white flex items-center space-x-1.5">
+                    <span className="truncate max-w-[120px]">{currentUser.full_name}</span>
+                    {currentUser.role === "ADMIN" && (
+                      <span className="px-1.5 py-0.2 text-[9px] font-black bg-yellow-400 text-black rounded">ADMIN</span>
+                    )}
+                    {currentUser.role === "FACULTY" && (
+                      <span className="px-1.5 py-0.2 text-[9px] font-bold bg-sky-400/20 text-sky-400 border border-sky-400/30 rounded">FACULTY</span>
+                    )}
+                    {currentUser.role === "STUDENT" && (
+                      <span className="px-1.5 py-0.2 text-[9px] font-bold bg-emerald-400/20 text-emerald-400 border border-emerald-400/30 rounded">STUDENT</span>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-zinc-400 truncate max-w-[120px]">{currentUser.email}</div>
+                </div>
+              </div>
+
+              <button
+                onClick={handleLogout}
+                title="Sign Out"
+                className="px-2.5 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-400 hover:text-rose-400 border border-zinc-800 transition flex items-center space-x-1 text-xs font-semibold"
+              >
+                <Icon name="log-out" className="w-3.5 h-3.5" />
+                <span className="hidden md:inline">Sign Out</span>
+              </button>
+            </div>
           </div>
         </div>
       </header>
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {/* Role Portal Views */}
+        {currentUser?.role === "FACULTY" && (
+          <FacultyPortal
+            facultySchedule={facultySchedule}
+            activeSubTab={activeTab}
+            onNavigate={(tab) => setActiveTab(tab)}
+            currentUser={currentUser}
+            roleLoading={roleLoading}
+            onRefresh={() => loadFacultyData()}
+          />
+        )}
+
+        {currentUser?.role === "STUDENT" && (
+          <StudentPortal
+            studentSchedule={studentSchedule}
+            activeSubTab={activeTab}
+            onNavigate={(tab) => setActiveTab(tab)}
+            currentUser={currentUser}
+            roleLoading={roleLoading}
+            onRefresh={() => loadStudentData()}
+          />
+        )}
         {activeTab === "landing" && (
           <LandingPage 
             onOpenScheduler={() => setActiveTab("generate")}
@@ -3348,6 +3619,1055 @@ function DataEditModal({ entityType, item, dataset, onSave, onClose }) {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+
+// ==========================================================================
+// AUTHENTICATION & LOGIN / SIGNUP SCREEN COMPONENT
+// ==========================================================================
+function AuthScreen({ onLoginSuccess, apiOnline, engineInfo }) {
+  const [mode, setMode] = useState("login"); // "login" | "signup"
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // Signup fields
+  const [fullName, setFullName] = useState("");
+  const [regNo, setRegNo] = useState("");
+  const [department, setDepartment] = useState("Computer Science");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [signupSuccess, setSignupSuccess] = useState("");
+
+  const demoAccounts = [
+    {
+      role: "ADMIN",
+      badgeClass: "bg-yellow-400 text-black font-black",
+      title: "Academic Administrator",
+      subtitle: "Full Access & Solver Control",
+      email: "admin@schedulr.demo",
+      password: "Schedulr2026!",
+      desc: "Full timetable solver, Conflict Lab, What-If simulator, and Backlog clearance."
+    },
+    {
+      role: "FACULTY",
+      badgeClass: "bg-sky-400/20 text-sky-400 border border-sky-400/30 font-bold",
+      title: "Dr. Alan Turing",
+      subtitle: "CS Department Faculty",
+      email: "faculty@schedulr.demo",
+      password: "Faculty2026!",
+      desc: "Personal teaching timetable, assigned course sections, workload & availability."
+    },
+    {
+      role: "STUDENT",
+      badgeClass: "bg-emerald-400/20 text-emerald-400 border border-emerald-400/30 font-bold",
+      title: "Alex Vance (2026CS104)",
+      subtitle: "Enrolled & Backlog Student",
+      email: "student@schedulr.demo",
+      password: "Student2026!",
+      desc: "Personal enrolled timetable, dynamic backlog status & freed study slots."
+    }
+  ];
+
+  async function handleLoginSubmit(targetEmail = email, targetPassword = password) {
+    if (!targetEmail.trim() || !targetPassword) {
+      setErrorMsg("Please enter both email and password.");
+      return;
+    }
+    setErrorMsg("");
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: targetEmail.trim(), password: targetPassword })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        onLoginSuccess(data.access_token, data.user);
+      } else {
+        setErrorMsg(data.detail || "Invalid credentials. Please verify your email and password.");
+      }
+    } catch (err) {
+      setErrorMsg("Unable to reach Schedulr API service. Please verify server status.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSignupSubmit(e) {
+    e.preventDefault();
+    setErrorMsg("");
+    setSignupSuccess("");
+    if (!fullName.trim()) {
+      setErrorMsg("Please enter your full name.");
+      return;
+    }
+    if (!email.trim() || !email.includes("@")) {
+      setErrorMsg("Please enter a valid email address.");
+      return;
+    }
+    if (password.length < 8) {
+      setErrorMsg("Password must be at least 8 characters long.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setErrorMsg("Passwords do not match. Please re-enter.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/auth/signup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          full_name: fullName.trim(),
+          registration_number: regNo.trim() || undefined,
+          department: department,
+          email: email.trim().toLowerCase(),
+          password: password,
+          confirm_password: confirmPassword
+        })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setSignupSuccess("Account created successfully! Redirecting to student portal...");
+        setTimeout(() => {
+          onLoginSuccess(data.access_token, data.user);
+        }, 700);
+      } else {
+        setErrorMsg(data.detail || "Registration failed. Please check your details.");
+      }
+    } catch (err) {
+      setErrorMsg("Network error connecting to registration server.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function quickFillAndLogin(acc) {
+    setEmail(acc.email);
+    setPassword(acc.password);
+    setMode("login");
+    setErrorMsg("");
+    handleLoginSubmit(acc.email, acc.password);
+  }
+
+  return (
+    <div className="min-h-screen bg-[#09090b] text-white flex flex-col justify-between selection:bg-yellow-400 selection:text-black">
+      {/* Top Banner */}
+      <header className="border-b border-zinc-800/80 bg-[#0c0c0e]/80 backdrop-blur px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center space-x-3">
+          <div className="w-9 h-9 rounded-xl bg-yellow-400 text-black flex items-center justify-center font-black shadow-lg shadow-yellow-500/25">
+            <Icon name="calendar-check" className="w-5 h-5 stroke-[2.5]" />
+          </div>
+          <div>
+            <span className="text-lg font-black tracking-tight text-white">Schedulr</span>
+            <span className="ml-2 px-2 py-0.5 text-[11px] font-bold bg-yellow-400/10 text-yellow-400 rounded-full border border-yellow-400/30">
+              Clash Resolver
+            </span>
+          </div>
+        </div>
+        <div className="flex items-center space-x-2 text-xs text-zinc-400 bg-zinc-900/90 px-3 py-1.5 rounded-lg border border-zinc-800">
+          <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></span>
+          <span className="font-mono">{engineInfo || "Google OR-Tools CP-SAT"}</span>
+        </div>
+      </header>
+
+      {/* Main Auth Content Container */}
+      <main className="flex-1 flex items-center justify-center p-4 sm:p-6 my-6">
+        <div className="max-w-xl w-full space-y-6">
+          
+          {/* Schedulr Title & Intro */}
+          <div className="text-center space-y-2">
+            <div className="inline-flex items-center space-x-2 px-3 py-1 rounded-full bg-yellow-400/10 border border-yellow-400/30 text-yellow-400 text-xs font-bold tracking-wide uppercase">
+              <Icon name="sparkles" className="w-3.5 h-3.5" />
+              <span>Role-Based Access Control • University Timetable Portal</span>
+            </div>
+            <h1 className="text-3xl sm:text-4xl font-black tracking-tight text-white">
+              Sign in to <span className="text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 to-amber-200">Schedulr</span>
+            </h1>
+            <p className="text-sm text-zinc-400 max-w-md mx-auto">
+              Intelligent timetable clash resolution for Administrators, Faculty members, and Students.
+            </p>
+          </div>
+
+          {/* Expandable / 1-Click Demo Accounts Card */}
+          <div className="bg-[#121215] border-2 border-yellow-400/30 rounded-2xl p-4 sm:p-5 shadow-2xl shadow-yellow-500/5 relative overflow-hidden">
+            <div className="flex items-center justify-between pb-3 border-b border-zinc-800">
+              <div className="flex items-center space-x-2">
+                <Icon name="key" className="w-4 h-4 text-yellow-400" />
+                <span className="text-xs font-bold uppercase tracking-wider text-yellow-400">
+                  Demo Showcase Credentials (1-Click Access)
+                </span>
+              </div>
+              <span className="text-[11px] text-zinc-400 font-mono">Bcrypt + JWT</span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-3">
+              {demoAccounts.map(acc => (
+                <button
+                  key={acc.role}
+                  type="button"
+                  onClick={() => quickFillAndLogin(acc)}
+                  disabled={loading}
+                  className="p-3 rounded-xl bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-800 hover:border-yellow-400/50 text-left transition transform hover:-translate-y-0.5 group focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] ${acc.badgeClass}`}>
+                      {acc.role}
+                    </span>
+                    <Icon name="arrow-right" className="w-3.5 h-3.5 text-zinc-500 group-hover:text-yellow-400 transition" />
+                  </div>
+                  <div className="text-xs font-bold text-white group-hover:text-yellow-300 transition">{acc.title}</div>
+                  <div className="text-[10px] text-zinc-400 truncate">{acc.email}</div>
+                  <div className="mt-2 text-[10px] text-yellow-400/80 font-semibold flex items-center space-x-1">
+                    <span>1-Click Sign In</span>
+                    <span>→</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Form Card (Sign In / Sign Up) */}
+          <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 sm:p-8 shadow-xl">
+            {/* Mode Toggle Buttons */}
+            <div className="flex rounded-xl bg-zinc-900 p-1 mb-6 border border-zinc-800">
+              <button
+                type="button"
+                onClick={() => { setMode("login"); setErrorMsg(""); }}
+                className={`flex-1 py-2 rounded-lg text-xs font-bold transition flex items-center justify-center space-x-2 ${
+                  mode === "login"
+                    ? "bg-yellow-400 text-black shadow-sm"
+                    : "text-zinc-400 hover:text-white"
+                }`}
+              >
+                <Icon name="lock" className="w-3.5 h-3.5" />
+                <span>Sign In to Account</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => { setMode("signup"); setErrorMsg(""); }}
+                className={`flex-1 py-2 rounded-lg text-xs font-bold transition flex items-center justify-center space-x-2 ${
+                  mode === "signup"
+                    ? "bg-yellow-400 text-black shadow-sm"
+                    : "text-zinc-400 hover:text-white"
+                }`}
+              >
+                <Icon name="graduation-cap" className="w-3.5 h-3.5" />
+                <span>Create Student Account</span>
+              </button>
+            </div>
+
+            {/* Error & Success Alerts */}
+            {errorMsg && (
+              <div className="mb-5 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-start space-x-2.5">
+                <Icon name="alert-triangle" className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
+            {signupSuccess && (
+              <div className="mb-5 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-start space-x-2.5">
+                <Icon name="check-circle-2" className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                <span>{signupSuccess}</span>
+              </div>
+            )}
+
+            {/* Mode 1: LOGIN FORM */}
+            {mode === "login" && (
+              <form onSubmit={(e) => { e.preventDefault(); handleLoginSubmit(); }} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-bold uppercase tracking-wider text-zinc-300 mb-1.5">
+                    Email Address
+                  </label>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-zinc-500">
+                      <Icon name="mail" className="w-4 h-4" />
+                    </div>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="admin@schedulr.demo"
+                      className="w-full pl-10 pr-4 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-400 focus:ring-1 focus:ring-yellow-400 transition"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="block text-xs font-bold uppercase tracking-wider text-zinc-300">
+                      Password
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="text-xs text-zinc-400 hover:text-yellow-400 flex items-center space-x-1"
+                    >
+                      <Icon name={showPassword ? "eye-off" : "eye"} className="w-3.5 h-3.5" />
+                      <span>{showPassword ? "Hide" : "Show"}</span>
+                    </button>
+                  </div>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-zinc-500">
+                      <Icon name="lock" className="w-4 h-4" />
+                    </div>
+                    <input
+                      type={showPassword ? "text" : "password"}
+                      required
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="••••••••••••"
+                      className="w-full pl-10 pr-10 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-400 focus:ring-1 focus:ring-yellow-400 transition"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full py-3 rounded-xl bg-yellow-400 hover:bg-yellow-300 text-black font-black text-sm shadow-lg shadow-yellow-500/20 active:scale-[0.99] transition flex items-center justify-center space-x-2 mt-2"
+                >
+                  {loading ? (
+                    <>
+                      <Icon name="loader-2" className="animate-spin w-4 h-4 text-black" />
+                      <span>Authenticating...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Sign In to Workspace</span>
+                      <Icon name="arrow-right" className="w-4 h-4 text-black" />
+                    </>
+                  )}
+                </button>
+              </form>
+            )}
+
+            {/* Mode 2: SIGNUP FORM */}
+            {mode === "signup" && (
+              <form onSubmit={handleSignupSubmit} className="space-y-4">
+                <div className="p-3 bg-yellow-400/10 border border-yellow-400/20 rounded-xl text-xs text-yellow-300 flex items-start space-x-2">
+                  <Icon name="shield" className="w-4 h-4 text-yellow-400 shrink-0 mt-0.5" />
+                  <span>
+                    Public registration automatically provisions a <strong>Student Account</strong>. For Faculty or Administrator access, please contact the Academic Registrar.
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-zinc-300 mb-1">
+                      Full Name
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={fullName}
+                      onChange={(e) => setFullName(e.target.value)}
+                      placeholder="e.g. Maya Lin"
+                      className="w-full px-3.5 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-400 focus:ring-1 focus:ring-yellow-400 transition"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-zinc-300 mb-1">
+                      Reg Number
+                    </label>
+                    <input
+                      type="text"
+                      value={regNo}
+                      onChange={(e) => setRegNo(e.target.value)}
+                      placeholder="e.g. 2026CS112"
+                      className="w-full px-3.5 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-400 focus:ring-1 focus:ring-yellow-400 transition"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-zinc-300 mb-1">
+                      Department
+                    </label>
+                    <select
+                      value={department}
+                      onChange={(e) => setDepartment(e.target.value)}
+                      className="w-full px-3 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-sm text-white focus:outline-none focus:border-yellow-400 focus:ring-1 focus:ring-yellow-400 transition"
+                    >
+                      <option value="Computer Science">Computer Science</option>
+                      <option value="Electrical Eng">Electrical Eng</option>
+                      <option value="Mathematics">Mathematics</option>
+                      <option value="Mechanical Eng">Mechanical Eng</option>
+                      <option value="Physics">Physics</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-zinc-300 mb-1">
+                      Email Address
+                    </label>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="student@univ.edu"
+                      className="w-full px-3.5 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-400 focus:ring-1 focus:ring-yellow-400 transition"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-zinc-300 mb-1">
+                      Password (min 8)
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="••••••••••••"
+                      className="w-full px-3.5 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-400 focus:ring-1 focus:ring-yellow-400 transition"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-zinc-300 mb-1">
+                      Confirm Password
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      placeholder="••••••••••••"
+                      className="w-full px-3.5 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-400 focus:ring-1 focus:ring-yellow-400 transition"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full py-3 rounded-xl bg-yellow-400 hover:bg-yellow-300 text-black font-black text-sm shadow-lg shadow-yellow-500/20 active:scale-[0.99] transition flex items-center justify-center space-x-2 mt-3"
+                >
+                  {loading ? (
+                    <>
+                      <Icon name="loader-2" className="animate-spin w-4 h-4 text-black" />
+                      <span>Registering Student Account...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Complete Student Registration</span>
+                      <Icon name="arrow-right" className="w-4 h-4 text-black" />
+                    </>
+                  )}
+                </button>
+              </form>
+            )}
+          </div>
+
+          <div className="text-center text-xs text-zinc-400 flex items-center justify-center space-x-3">
+            <span>FastAPI Single Service</span>
+            <span>•</span>
+            <span>PostgreSQL / SQLite</span>
+            <span>•</span>
+            <span>Bcrypt Hashing</span>
+            <span>•</span>
+            <span>JWT Bearer</span>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+// ==========================================================================
+// FACULTY PORTAL COMPONENT
+// ==========================================================================
+function FacultyPortal({ facultySchedule, activeSubTab, onNavigate, currentUser, roleLoading, onRefresh }) {
+  const faculty = facultySchedule?.faculty || {
+    name: currentUser?.full_name || "Faculty Member",
+    email: currentUser?.email || "faculty@schedulr.demo",
+    department: currentUser?.department || "Computer Science",
+    max_daily_hours: 4
+  };
+  const sections = facultySchedule?.sections || [];
+  const assignments = facultySchedule?.assignments || [];
+  const insights = facultySchedule?.insights || {
+    total_assigned_sections: sections.length,
+    weekly_teaching_hours: assignments.length,
+    days_active: 3,
+    room_assignments: []
+  };
+
+  const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+  const hours = [9, 10, 11, 12, 13, 14, 15, 16];
+
+  return (
+    <div className="space-y-6">
+      {/* Header Profile Banner */}
+      <div className="bg-gradient-to-r from-zinc-900 via-[#121215] to-zinc-900 border border-zinc-800 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+        <div className="absolute top-0 right-0 w-80 h-80 bg-sky-500/5 rounded-full blur-3xl pointer-events-none"></div>
+        <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex items-center space-x-4">
+            <div className="w-14 h-14 rounded-2xl bg-sky-400/20 border border-sky-400/40 text-sky-400 flex items-center justify-center font-black text-xl shadow-lg">
+              {faculty.name ? faculty.name.charAt(0) : "F"}
+            </div>
+            <div>
+              <div className="flex items-center space-x-2">
+                <h1 className="text-2xl font-black text-white">{faculty.name}</h1>
+                <span className="px-2 py-0.5 rounded text-xs font-bold bg-sky-400/20 text-sky-400 border border-sky-400/30">
+                  FACULTY
+                </span>
+              </div>
+              <div className="text-sm text-zinc-400 flex flex-wrap items-center gap-x-3 gap-y-1 mt-0.5">
+                <span>{faculty.department}</span>
+                <span>•</span>
+                <span>{faculty.email}</span>
+                <span>•</span>
+                <span>Max Daily Load: {faculty.max_daily_hours} hrs</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-3">
+            <button
+              onClick={onRefresh}
+              disabled={roleLoading}
+              className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-xs font-bold border border-zinc-700 transition flex items-center space-x-1.5"
+            >
+              <Icon name="refresh-cw" className={`w-3.5 h-3.5 ${roleLoading ? 'animate-spin' : ''}`} />
+              <span>Refresh Schedule</span>
+            </button>
+          </div>
+        </div>
+
+        {/* KPI Cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-6 pt-6 border-t border-zinc-800/80">
+          <div className="p-3.5 bg-zinc-950/70 border border-zinc-800/80 rounded-xl">
+            <div className="text-xs text-zinc-400 font-medium">Assigned Sections</div>
+            <div className="text-2xl font-black text-white mt-1">{insights.total_assigned_sections}</div>
+          </div>
+          <div className="p-3.5 bg-zinc-950/70 border border-zinc-800/80 rounded-xl">
+            <div className="text-xs text-zinc-400 font-medium">Weekly Teaching Load</div>
+            <div className="text-2xl font-black text-yellow-400 mt-1">{insights.weekly_teaching_hours} <span className="text-xs text-zinc-400 font-normal">hrs/week</span></div>
+          </div>
+          <div className="p-3.5 bg-zinc-950/70 border border-zinc-800/80 rounded-xl">
+            <div className="text-xs text-zinc-400 font-medium">Active Teaching Days</div>
+            <div className="text-2xl font-black text-sky-400 mt-1">{insights.days_active} <span className="text-xs text-zinc-400 font-normal">days</span></div>
+          </div>
+          <div className="p-3.5 bg-zinc-950/70 border border-zinc-800/80 rounded-xl">
+            <div className="text-xs text-zinc-400 font-medium">Scheduled Venues</div>
+            <div className="text-lg font-bold text-emerald-400 mt-1 truncate">
+              {insights.room_assignments?.length ? insights.room_assignments.join(", ") : "Classrooms"}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Faculty Sub-Tab Views */}
+      {(!activeSubTab || activeSubTab === "faculty_timetable") && (
+        <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 shadow-xl space-y-4">
+          <div className="flex items-center justify-between pb-3 border-b border-zinc-800">
+            <div>
+              <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+                <Icon name="calendar" className="w-5 h-5 text-yellow-400" />
+                <span>My Weekly Teaching Timetable</span>
+              </h2>
+              <p className="text-xs text-zinc-400">Scheduled slots, lecture halls, and lab sessions assigned to you</p>
+            </div>
+            <div className="flex items-center space-x-2 text-xs">
+              <span className="flex items-center space-x-1.5 px-2 py-1 bg-yellow-400/10 text-yellow-400 border border-yellow-400/20 rounded-md">
+                <span className="w-2 h-2 rounded-full bg-yellow-400"></span>
+                <span>Assigned Class</span>
+              </span>
+              <span className="flex items-center space-x-1.5 px-2 py-1 bg-zinc-900 text-zinc-400 border border-zinc-800 rounded-md">
+                <span className="w-2 h-2 rounded-full bg-zinc-600"></span>
+                <span>Protected Lunch</span>
+              </span>
+            </div>
+          </div>
+
+          {/* Interactive Calendar Grid */}
+          <div className="overflow-x-auto">
+            <div className="min-w-[700px] border border-zinc-800 rounded-xl overflow-hidden">
+              <div className="grid grid-cols-6 bg-zinc-900/90 text-xs font-bold text-zinc-300 border-b border-zinc-800 text-center py-2.5">
+                <div className="text-zinc-500">Time</div>
+                {days.map(d => <div key={d} className="text-white">{d}</div>)}
+              </div>
+
+              {hours.map(hour => {
+                const isLunch = hour === 13;
+                const timeLabel = `${String(hour).padStart(2, '0')}:00 - ${String(hour + 1).padStart(2, '0')}:00`;
+                return (
+                  <div key={hour} className="grid grid-cols-6 border-b border-zinc-800/60 min-h-[64px]">
+                    <div className="p-2 border-r border-zinc-800/60 text-center text-xs font-mono text-zinc-400 flex items-center justify-center bg-zinc-950/40">
+                      {timeLabel}
+                    </div>
+                    {days.map(day => {
+                      if (isLunch) {
+                        return (
+                          <div key={day} className="p-2 border-r border-zinc-800/60 bg-zinc-900/40 text-center flex items-center justify-center text-zinc-500 text-xs italic">
+                            Protected Lunch
+                          </div>
+                        );
+                      }
+                      const asgn = assignments.find(a => a.day === day && a.start_time?.startsWith(String(hour).padStart(2, '0')));
+                      return (
+                        <div key={day} className="p-1.5 border-r border-zinc-800/60 bg-zinc-950/20 hover:bg-zinc-900/30 transition flex flex-col justify-center">
+                          {asgn ? (
+                            <div className="p-2 rounded-lg bg-yellow-400/15 border border-yellow-400/40 text-left space-y-1 shadow-sm">
+                              <div className="flex items-center justify-between">
+                                <span className="font-black text-xs text-yellow-300">{asgn.course_code}</span>
+                                <span className="text-[10px] px-1 bg-yellow-400 text-black font-bold rounded">Sec {asgn.section_label}</span>
+                              </div>
+                              <div className="text-[11px] text-zinc-200 font-semibold line-clamp-1">{asgn.course_name}</div>
+                              <div className="text-[10px] text-zinc-400 flex items-center justify-between">
+                                <span>{asgn.room_name}</span>
+                                <span>{asgn.enrolment_count} std</span>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="h-full flex items-center justify-center text-[10px] text-zinc-700">Free</div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeSubTab === "faculty_sections" && (
+        <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 shadow-xl space-y-4">
+          <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+            <Icon name="book-open" className="w-5 h-5 text-yellow-400" />
+            <span>Assigned Teaching Sections</span>
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {sections.map(sec => (
+              <div key={sec.id} className="p-5 rounded-xl bg-zinc-900/80 border border-zinc-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-base font-black text-yellow-400">{sec.course_code} - Section {sec.section_label}</span>
+                  <span className="px-2 py-0.5 text-xs font-bold bg-zinc-800 text-zinc-300 rounded border border-zinc-700">
+                    {sec.required_room_type || "Lecture"}
+                  </span>
+                </div>
+                <div className="text-sm font-semibold text-white">{sec.course_name}</div>
+                <div className="text-xs text-zinc-400 flex items-center justify-between pt-2 border-t border-zinc-800">
+                  <span>Enrolled Students: <strong className="text-white">{sec.enrolment_count}</strong></span>
+                  <span>Section ID: <code className="text-zinc-500 font-mono">{sec.id}</code></span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {activeSubTab === "faculty_availability" && (
+        <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 shadow-xl space-y-4">
+          <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+            <Icon name="clock" className="w-5 h-5 text-yellow-400" />
+            <span>Availability Preferences</span>
+          </h2>
+          <p className="text-sm text-zinc-400">
+            Schedulr guarantees faculty hard constraints: no overlapping teaching assignments and respecting configured unavailable periods.
+          </p>
+          <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 text-xs space-y-2">
+            <div className="font-bold text-white">Daily Teaching Limit: <span className="text-yellow-400">{faculty.max_daily_hours} hours maximum</span></div>
+            <div className="font-bold text-white">Protected Lunch Break: <span className="text-emerald-400">Enforced 13:00 - 14:00</span></div>
+            <div className="text-zinc-400 pt-1">
+              {faculty.unavailable_slots?.length
+                ? `Declared unavailable slots: ${faculty.unavailable_slots.join(", ")}`
+                : "No restricted periods declared; available for standard academic schedule."}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeSubTab === "faculty_insights" && (
+        <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 shadow-xl space-y-4">
+          <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+            <Icon name="sparkles" className="w-5 h-5 text-yellow-400" />
+            <span>Teaching & Workload Insights</span>
+          </h2>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+              <div className="text-xs text-zinc-400">Contact Hours</div>
+              <div className="text-2xl font-black text-white mt-1">{assignments.length} hrs</div>
+              <div className="text-[11px] text-zinc-500 mt-1">Per teaching week</div>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+              <div className="text-xs text-zinc-400">Student Reach</div>
+              <div className="text-2xl font-black text-yellow-400 mt-1">
+                {sections.reduce((acc, s) => acc + (s.enrolment_count || 0), 0)}
+              </div>
+              <div className="text-[11px] text-zinc-500 mt-1">Across all assigned sections</div>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+              <div className="text-xs text-zinc-400">Schedule Health</div>
+              <div className="text-2xl font-black text-emerald-400 mt-1">100%</div>
+              <div className="text-[11px] text-zinc-500 mt-1">Zero timetable clashes</div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ==========================================================================
+// STUDENT PORTAL COMPONENT (WITH DYNAMIC BACKLOG FREED SLOTS)
+// ==========================================================================
+function StudentPortal({ studentSchedule, activeSubTab, onNavigate, currentUser, roleLoading, onRefresh }) {
+  const student = studentSchedule?.student || {
+    name: currentUser?.full_name || "Student",
+    registration_number: currentUser?.registration_number || "2026CS104",
+    email: currentUser?.email || "student@schedulr.demo",
+    department: currentUser?.department || "Computer Science",
+    semester: 6
+  };
+  const enrolments = studentSchedule?.enrolments || [];
+  const activeBacklogs = studentSchedule?.active_backlogs || [];
+  const clearedBacklogs = studentSchedule?.cleared_backlogs || [];
+  const assignments = studentSchedule?.assignments || [];
+  const freedSlots = studentSchedule?.freed_slots || [];
+  const stats = studentSchedule?.stats || {
+    active_courses_count: assignments.length,
+    cleared_backlogs_count: clearedBacklogs.length,
+    scheduled_hours: assignments.length,
+    free_periods: 31
+  };
+
+  const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+  const hours = [9, 10, 11, 12, 13, 14, 15, 16];
+
+  return (
+    <div className="space-y-6">
+      {/* Student Banner */}
+      <div className="bg-gradient-to-r from-zinc-900 via-[#121215] to-zinc-900 border border-zinc-800 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+        <div className="absolute top-0 right-0 w-80 h-80 bg-emerald-500/5 rounded-full blur-3xl pointer-events-none"></div>
+        <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex items-center space-x-4">
+            <div className="w-14 h-14 rounded-2xl bg-emerald-400/20 border border-emerald-400/40 text-emerald-400 flex items-center justify-center font-black text-xl shadow-lg">
+              {student.name ? student.name.charAt(0) : "S"}
+            </div>
+            <div>
+              <div className="flex items-center space-x-2">
+                <h1 className="text-2xl font-black text-white">{student.name}</h1>
+                <span className="px-2 py-0.5 rounded text-xs font-bold bg-emerald-400/20 text-emerald-400 border border-emerald-400/30">
+                  STUDENT
+                </span>
+                <span className="px-2 py-0.5 rounded text-xs font-mono bg-zinc-800 text-zinc-300 border border-zinc-700">
+                  {student.registration_number}
+                </span>
+              </div>
+              <div className="text-sm text-zinc-400 flex flex-wrap items-center gap-x-3 gap-y-1 mt-0.5">
+                <span>{student.department}</span>
+                <span>•</span>
+                <span>Semester {student.semester}</span>
+                <span>•</span>
+                <span>{student.email}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-3">
+            <button
+              onClick={onRefresh}
+              disabled={roleLoading}
+              className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-xs font-bold border border-zinc-700 transition flex items-center space-x-1.5"
+            >
+              <Icon name="refresh-cw" className={`w-3.5 h-3.5 ${roleLoading ? 'animate-spin' : ''}`} />
+              <span>Refresh Schedule</span>
+            </button>
+          </div>
+        </div>
+
+        {/* KPI Cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-6 pt-6 border-t border-zinc-800/80">
+          <div className="p-3.5 bg-zinc-950/70 border border-zinc-800/80 rounded-xl">
+            <div className="text-xs text-zinc-400 font-medium">Active Courses</div>
+            <div className="text-2xl font-black text-white mt-1">{stats.active_courses_count}</div>
+          </div>
+          <div className="p-3.5 bg-zinc-950/70 border border-zinc-800/80 rounded-xl">
+            <div className="text-xs text-zinc-400 font-medium">Active Backlogs</div>
+            <div className="text-2xl font-black text-amber-400 mt-1">{activeBacklogs.length}</div>
+          </div>
+          <div className="p-3.5 bg-zinc-950/70 border border-zinc-800/80 rounded-xl">
+            <div className="text-xs text-zinc-400 font-medium">Cleared Backlogs</div>
+            <div className="text-2xl font-black text-emerald-400 mt-1">{clearedBacklogs.length || stats.cleared_backlogs_count}</div>
+          </div>
+          <div className="p-3.5 bg-zinc-950/70 border border-zinc-800/80 rounded-xl">
+            <div className="text-xs text-zinc-400 font-medium">Weekly Study Periods</div>
+            <div className="text-2xl font-black text-yellow-400 mt-1">{stats.free_periods} <span className="text-xs text-zinc-400 font-normal">slots</span></div>
+          </div>
+        </div>
+      </div>
+
+      {/* Dynamic Backlog Clearance Notice Banner (if any backlog freed slots exist) */}
+      {freedSlots.length > 0 && (
+        <div className="p-4 rounded-2xl bg-emerald-950/30 border-2 border-emerald-500/40 text-emerald-200 flex items-start space-x-3.5 shadow-lg">
+          <div className="w-8 h-8 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 flex items-center justify-center shrink-0 mt-0.5">
+            <Icon name="sparkles" className="w-4 h-4" />
+          </div>
+          <div className="flex-1 space-y-1">
+            <div className="text-sm font-black text-emerald-300">
+              ✨ Dynamic Backlog Resolution Active: {freedSlots.length} Slot(s) Freed!
+            </div>
+            <div className="text-xs text-zinc-300 leading-relaxed">
+              You cleared backlog course <strong>{freedSlots[0].course_code} ({freedSlots[0].course_name})</strong>!
+              Schedulr has automatically removed it from your personal schedule, freeing <strong>{freedSlots[0].day} {freedSlots[0].start_time}-{freedSlots[0].end_time}</strong> for your personal study time. The course section remains scheduled for other peers without disrupting room or faculty assignments.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sub-Tab 1: MY TIMETABLE */}
+      {(!activeSubTab || activeSubTab === "student_timetable") && (
+        <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 shadow-xl space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-zinc-800">
+            <div>
+              <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+                <Icon name="calendar" className="w-5 h-5 text-yellow-400" />
+                <span>My Personal Weekly Timetable</span>
+              </h2>
+              <p className="text-xs text-zinc-400">Clash-free class schedule tailored to your active enrollments</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="flex items-center space-x-1.5 px-2 py-1 bg-yellow-400/10 text-yellow-400 border border-yellow-400/20 rounded-md">
+                <span className="w-2 h-2 rounded-full bg-yellow-400"></span>
+                <span>Enrolled Class</span>
+              </span>
+              <span className="flex items-center space-x-1.5 px-2 py-1 bg-emerald-950/40 text-emerald-300 border border-emerald-500/30 rounded-md">
+                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                <span>Free after backlog cleared</span>
+              </span>
+              <span className="flex items-center space-x-1.5 px-2 py-1 bg-zinc-900 text-zinc-400 border border-zinc-800 rounded-md">
+                <span className="w-2 h-2 rounded-full bg-zinc-600"></span>
+                <span>Protected Lunch</span>
+              </span>
+            </div>
+          </div>
+
+          {/* Interactive Timetable Grid */}
+          <div className="overflow-x-auto">
+            <div className="min-w-[720px] border border-zinc-800 rounded-xl overflow-hidden">
+              <div className="grid grid-cols-6 bg-zinc-900/90 text-xs font-bold text-zinc-300 border-b border-zinc-800 text-center py-2.5">
+                <div className="text-zinc-500">Time</div>
+                {days.map(d => <div key={d} className="text-white">{d}</div>)}
+              </div>
+
+              {hours.map(hour => {
+                const isLunch = hour === 13;
+                const timeLabel = `${String(hour).padStart(2, '0')}:00 - ${String(hour + 1).padStart(2, '0')}:00`;
+                return (
+                  <div key={hour} className="grid grid-cols-6 border-b border-zinc-800/60 min-h-[64px]">
+                    <div className="p-2 border-r border-zinc-800/60 text-center text-xs font-mono text-zinc-400 flex items-center justify-center bg-zinc-950/40">
+                      {timeLabel}
+                    </div>
+                    {days.map(day => {
+                      if (isLunch) {
+                        return (
+                          <div key={day} className="p-2 border-r border-zinc-800/60 bg-zinc-900/40 text-center flex items-center justify-center text-zinc-500 text-xs italic">
+                            Protected Lunch
+                          </div>
+                        );
+                      }
+
+                      // Check for active class assignment
+                      const asgn = assignments.find(a => a.day === day && a.start_time?.startsWith(String(hour).padStart(2, '0')));
+                      // Check for freed slot resulting from cleared backlog
+                      const freed = freedSlots.find(f => f.day === day && f.start_time?.startsWith(String(hour).padStart(2, '0')));
+
+                      return (
+                        <div key={day} className="p-1.5 border-r border-zinc-800/60 bg-zinc-950/20 hover:bg-zinc-900/30 transition flex flex-col justify-center">
+                          {asgn ? (
+                            <div className="p-2 rounded-lg bg-yellow-400/15 border border-yellow-400/40 text-left space-y-1 shadow-sm">
+                              <div className="flex items-center justify-between">
+                                <span className="font-black text-xs text-yellow-300">{asgn.course_code}</span>
+                                <span className="text-[10px] px-1 bg-yellow-400 text-black font-bold rounded">Sec {asgn.section_label}</span>
+                              </div>
+                              <div className="text-[11px] text-zinc-200 font-semibold line-clamp-1">{asgn.course_name}</div>
+                              <div className="text-[10px] text-zinc-400 flex items-center justify-between">
+                                <span>{asgn.room_name}</span>
+                                <span className="truncate max-w-[80px]">{asgn.faculty_name}</span>
+                              </div>
+                            </div>
+                          ) : freed ? (
+                            /* Highlighted "Free after backlog cleared" slot */
+                            <div className="p-2 rounded-lg bg-emerald-950/30 border-2 border-dashed border-emerald-500/60 text-left space-y-1 shadow-sm animate-pulse">
+                              <div className="flex items-center justify-between">
+                                <span className="font-bold text-[11px] text-emerald-300 flex items-center space-x-1">
+                                  <span>✨</span>
+                                  <span>Free Slot</span>
+                                </span>
+                                <span className="text-[9px] px-1 py-0.5 bg-emerald-500/20 text-emerald-300 font-bold rounded border border-emerald-500/30">
+                                  Cleared
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-zinc-300 line-clamp-1 font-medium">
+                                Formerly: {freed.course_code}
+                              </div>
+                              <div className="text-[9px] text-emerald-400/80">
+                                Dedicated study time
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="h-full flex items-center justify-center text-[10px] text-zinc-700">Free</div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sub-Tab 2: MY ENROLLED COURSES */}
+      {activeSubTab === "student_courses" && (
+        <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 shadow-xl space-y-4">
+          <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+            <Icon name="book-open" className="w-5 h-5 text-yellow-400" />
+            <span>My Registered Courses</span>
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {enrolments.map(enr => (
+              <div key={enr.id} className="p-5 rounded-xl bg-zinc-900/80 border border-zinc-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-base font-black text-yellow-400">{enr.section_id}</span>
+                  <span className={`px-2 py-0.5 text-xs font-bold rounded border ${
+                    enr.status === 'Cleared'
+                      ? 'bg-emerald-400/20 text-emerald-300 border-emerald-400/30'
+                      : (enr.enrolment_type === 'Backlog' || enr.enrolmentType === 'Backlog')
+                      ? 'bg-amber-400/20 text-amber-300 border-amber-400/30'
+                      : 'bg-zinc-800 text-zinc-300 border-zinc-700'
+                  }`}>
+                    {enr.status === 'Cleared' ? 'Cleared Backlog' : `${enr.enrolment_type || enr.enrolmentType || 'Regular'} (${enr.status})`}
+                  </span>
+                </div>
+                <div className="text-xs text-zinc-400">
+                  {enr.notes || "Enrolled in academic curriculum."}
+                </div>
+                <div className="text-[11px] text-zinc-500 font-mono pt-2 border-t border-zinc-800">
+                  Enrolment Ref: {enr.id}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Sub-Tab 3: MY BACKLOGS & FREED SLOTS */}
+      {activeSubTab === "student_backlogs" && (
+        <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 shadow-xl space-y-6">
+          <div>
+            <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+              <Icon name="layers" className="w-5 h-5 text-yellow-400" />
+              <span>Dynamic Backlog Resolution Status</span>
+            </h2>
+            <p className="text-xs text-zinc-400 mt-1">
+              Tracks active backlog obligations and verified cleared subjects with automatically liberated study periods.
+            </p>
+          </div>
+
+          {/* Cleared Backlogs & Freed Slots */}
+          <div className="space-y-3">
+            <h3 className="text-sm font-bold text-emerald-400 uppercase tracking-wider flex items-center space-x-2">
+              <Icon name="check-circle-2" className="w-4 h-4 text-emerald-400" />
+              <span>Cleared Backlog Subjects & Freed Slots ({clearedBacklogs.length})</span>
+            </h3>
+            {clearedBacklogs.length === 0 ? (
+              <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-zinc-400">
+                No backlog subjects cleared yet.
+              </div>
+            ) : (
+              clearedBacklogs.map(cb => (
+                <div key={cb.id} className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-500/30 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="font-black text-sm text-emerald-300">{cb.section_id}</span>
+                    <span className="px-2 py-0.5 text-xs font-black bg-emerald-400 text-black rounded">
+                      CLEARED (Slot Freed)
+                    </span>
+                  </div>
+                  <div className="text-xs text-zinc-300">
+                    {cb.notes || "Backlog examination cleared."}
+                  </div>
+                  <div className="text-[11px] text-emerald-400/80 font-mono">
+                    Updated by {cb.updated_by || "Academic Office"} • Status: Free after backlog cleared
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Active Backlogs */}
+          <div className="space-y-3">
+            <h3 className="text-sm font-bold text-amber-400 uppercase tracking-wider flex items-center space-x-2">
+              <Icon name="alert-triangle" className="w-4 h-4 text-amber-400" />
+              <span>Active Backlog Subjects ({activeBacklogs.length})</span>
+            </h3>
+            {activeBacklogs.length === 0 ? (
+              <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-emerald-400 font-semibold">
+                ✓ No active backlogs! You are fully on track with your academic program.
+              </div>
+            ) : (
+              activeBacklogs.map(ab => (
+                <div key={ab.id} className="p-4 rounded-xl bg-amber-950/20 border border-amber-500/30 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="font-black text-sm text-amber-300">{ab.section_id}</span>
+                    <span className="px-2 py-0.5 text-xs font-bold bg-amber-400/20 text-amber-400 border border-amber-400/30 rounded">
+                      Active (Pending Examination)
+                    </span>
+                  </div>
+                  <div className="text-xs text-zinc-300">
+                    {ab.notes || "Enrolled in backlog examination cycle."}
+                  </div>
+                  <div className="text-[11px] text-zinc-400">
+                    Once cleared by the Registrar, this slot will automatically be freed in your personal timetable.
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {activeSubTab === "student_profile" && (
+        <div className="bg-[#121215] border border-zinc-800 rounded-2xl p-6 shadow-xl space-y-4">
+          <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+            <Icon name="user" className="w-5 h-5 text-yellow-400" />
+            <span>Academic Profile</span>
+          </h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-1">
+              <div className="text-xs text-zinc-400">Full Name</div>
+              <div className="text-sm font-bold text-white">{student.name}</div>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-1">
+              <div className="text-xs text-zinc-400">Registration Number</div>
+              <div className="text-sm font-bold text-yellow-400 font-mono">{student.registration_number}</div>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-1">
+              <div className="text-xs text-zinc-400">Department</div>
+              <div className="text-sm font-bold text-white">{student.department}</div>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-1">
+              <div className="text-xs text-zinc-400">Current Semester</div>
+              <div className="text-sm font-bold text-white">Semester {student.semester}</div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

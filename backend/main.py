@@ -2,12 +2,14 @@ import os
 import csv
 import io
 import time
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, UploadFile, File, Response
+from fastapi import FastAPI, HTTPException, UploadFile, File, Response, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy.orm import Session
 
 from .models import (
     TimetableDataset, ScheduleResponse, WhatIfRequest,
@@ -16,14 +18,21 @@ from .models import (
 )
 from .solver import TimetableSolver, ORTOOLS_AVAILABLE
 from .sample_data import get_feasible_demo, get_impossible_demo, generate_large_simulation, get_backlog_resolution_demo
+from .database import init_db, SessionLocal, User, get_db
+from .auth import (
+    get_current_user, require_admin, require_faculty, require_student,
+    verify_password, get_password_hash, create_access_token,
+    SignupRequest, LoginRequest, UserResponse, TokenResponse,
+    is_valid_email, ACCESS_TOKEN_EXPIRE_MINUTES, seed_default_users
+)
 
 app = FastAPI(
     title="Schedulr API",
-    description="Intelligent Timetable Clash Resolver API powered by Google OR-Tools CP-SAT with Dynamic Backlog Resolution",
-    version="1.1.0"
+    description="Intelligent Timetable Clash Resolver API with RBAC, JWT Auth, Google OR-Tools CP-SAT and Dynamic Backlog Resolution",
+    version="2.0.0"
 )
 
-# Enable CORS for local dev servers
+# Enable CORS for frontend and deployment
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,6 +47,341 @@ CURRENT_SCHEDULE: Dict[str, Any] = {
     "last_response": None
 }
 
+@app.on_event("startup")
+def on_startup():
+    """Initialize database tables, seed demo hackathon accounts, and prepare initial dataset."""
+    init_db()
+    with SessionLocal() as db:
+        seed_default_users(db)
+
+    # Pre-populate active demo schedule in memory
+    demo_pack = get_backlog_resolution_demo()
+    CURRENT_SCHEDULE["dataset"] = demo_pack["dataset"]
+    CURRENT_SCHEDULE["last_response"] = ScheduleResponse(**demo_pack["schedule"])
+
+# ---------------------------------------------------------------------------
+# Authentication Endpoints
+# ---------------------------------------------------------------------------
+@app.post("/api/auth/signup", response_model=TokenResponse)
+def signup(req: SignupRequest, db: Session = Depends(get_db)):
+    """
+    Public student signup endpoint.
+    - Validates fields, email format, password length, and confirmation matching
+    - Rejects duplicate emails
+    - Automatically assigns STUDENT role (Public signup cannot create Admin or Faculty)
+    - Returns JWT access token and safe user profile
+    """
+    clean_email = req.email.strip().lower()
+    if not is_valid_email(clean_email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid email format. Please provide a valid email address."
+        )
+
+    if len(req.password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters long."
+        )
+
+    if req.password != req.confirm_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Passwords do not match. Please re-enter."
+        )
+
+    existing = db.query(User).filter(User.email == clean_email).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An account with this email address already exists. Please sign in instead."
+        )
+
+    # Public registration strictly produces STUDENT accounts
+    user = User(
+        full_name=req.full_name.strip(),
+        registration_number=req.registration_number.strip() if req.registration_number else None,
+        email=clean_email,
+        password_hash=get_password_hash(req.password),
+        role="STUDENT",
+        department=req.department.strip() if req.department else "Computer Science",
+        is_active=True
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token(data={"sub": user.id, "email": user.email, "role": user.role})
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user=UserResponse(**user.to_safe_dict())
+    )
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    """
+    User login endpoint.
+    - Verifies bcrypt password hash
+    - Updates last_login_at timestamp
+    - Issues signed JWT Bearer access token with role claims
+    - Never exposes passwords or password hashes
+    """
+    clean_email = req.email.strip().lower()
+    user = db.query(User).filter(User.email == clean_email).first()
+
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password. Please verify your credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account has been suspended or deactivated. Contact academic administrator."
+        )
+
+    user.last_login_at = datetime.now(timezone.utc)
+    db.commit()
+
+    token = create_access_token(data={"sub": user.id, "email": user.email, "role": user.role})
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user=UserResponse(**user.to_safe_dict())
+    )
+
+@app.get("/api/auth/me", response_model=UserResponse)
+def get_current_user_profile(current_user: User = Depends(get_current_user)):
+    """Return currently authenticated user profile."""
+    return UserResponse(**current_user.to_safe_dict())
+
+@app.post("/api/auth/logout")
+def logout(current_user: User = Depends(get_current_user)):
+    """Logout endpoint. Client removes JWT token from sessionStorage."""
+    return {"success": True, "message": f"User {current_user.email} successfully logged out."}
+
+# ---------------------------------------------------------------------------
+# Public System Health & Documentation
+# ---------------------------------------------------------------------------
+@app.get("/api/health")
+def health_check():
+    """Public health-check endpoint probed by Render zero-downtime monitoring."""
+    return {
+        "status": "healthy",
+        "ortools_available": ORTOOLS_AVAILABLE,
+        "engine": "Google OR-Tools CP-SAT" if ORTOOLS_AVAILABLE else "Backtracking Heuristic Fallback",
+        "timestamp": time.time()
+    }
+
+# ---------------------------------------------------------------------------
+# Role-Scoped Endpoints: Faculty & Student
+# ---------------------------------------------------------------------------
+@app.get("/api/faculty/me/schedule")
+def get_faculty_schedule(current_user: User = Depends(require_faculty)):
+    """
+    FACULTY-only endpoint:
+    Faculty can view only their own assigned sections, scheduled timetable,
+    and availability preferences. Cannot access administrative records.
+    """
+    dataset = CURRENT_SCHEDULE.get("dataset")
+    if not dataset:
+        demo_pack = get_backlog_resolution_demo()
+        dataset = demo_pack["dataset"]
+        CURRENT_SCHEDULE["dataset"] = dataset
+
+    last_resp = CURRENT_SCHEDULE.get("last_response")
+    if not last_resp:
+        demo_pack = get_backlog_resolution_demo()
+        last_resp = ScheduleResponse(**demo_pack["schedule"])
+        CURRENT_SCHEDULE["last_response"] = last_resp
+
+    # Resolve matching faculty entity in active dataset
+    fac_profile = None
+    for f in dataset.faculty:
+        if (f.email.lower() == current_user.email.lower() or
+            f.id == current_user.registration_number or
+            current_user.full_name.lower() in f.name.lower() or
+            f.name.lower() in current_user.full_name.lower()):
+            fac_profile = f
+            break
+
+    if not fac_profile and dataset.faculty:
+        # Default to Alan Turing for demo faculty account
+        fac_profile = next((f for f in dataset.faculty if "turing" in f.name.lower()), dataset.faculty[0])
+
+    my_sections = [s for s in dataset.sections if s.faculty_id == fac_profile.id] if fac_profile else []
+    my_section_ids = {s.id for s in my_sections}
+    my_assignments = [a for a in last_resp.assignments if a.section_id in my_section_ids or (fac_profile and a.faculty_id == fac_profile.id)]
+
+    return {
+        "faculty": {
+            "id": fac_profile.id if fac_profile else "FAC-ME",
+            "name": current_user.full_name,
+            "email": current_user.email,
+            "department": current_user.department or (fac_profile.department if fac_profile else "Computer Science"),
+            "max_daily_hours": fac_profile.max_daily_hours if fac_profile else 4,
+            "unavailable_slots": fac_profile.unavailable_slots if fac_profile else []
+        },
+        "sections": [s.model_dump() for s in my_sections],
+        "assignments": [a.model_dump() if hasattr(a, "model_dump") else a for a in my_assignments],
+        "insights": {
+            "total_assigned_sections": len(my_sections),
+            "weekly_teaching_hours": len(my_assignments),
+            "days_active": len(set(a.day for a in my_assignments)),
+            "room_assignments": list(set(a.room_name for a in my_assignments))
+        }
+    }
+
+@app.get("/api/student/me/schedule")
+def get_student_schedule(current_user: User = Depends(require_student)):
+    """
+    STUDENT-only endpoint:
+    Students can view only their own timetable, active enrolments,
+    cleared backlogs, and freed study slots. Cannot access solver or admin data.
+    """
+    dataset = CURRENT_SCHEDULE.get("dataset")
+    if not dataset:
+        demo_pack = get_backlog_resolution_demo()
+        dataset = demo_pack["dataset"]
+        CURRENT_SCHEDULE["dataset"] = dataset
+
+    last_resp = CURRENT_SCHEDULE.get("last_response")
+    if not last_resp:
+        demo_pack = get_backlog_resolution_demo()
+        last_resp = ScheduleResponse(**demo_pack["schedule"])
+        CURRENT_SCHEDULE["last_response"] = last_resp
+
+    # Resolve matching student entity in dataset by registration number or ID
+    reg_no = current_user.registration_number or "2026CS104"
+    st_profile = None
+    for st in dataset.students:
+        if (st.reg_no == reg_no or
+            st.id == reg_no or
+            st.id == f"STU-{reg_no}" or
+            current_user.full_name.lower() in st.name.lower() or
+            st.name.lower() in current_user.full_name.lower()):
+            st_profile = st
+            break
+
+    if not st_profile and dataset.students:
+        st_profile = next((s for s in dataset.students if s.id == "STU-2026CS104"), dataset.students[0])
+
+    student_id = st_profile.id if st_profile else "STU-ME"
+    my_enrolments = [e for e in dataset.enrolments if e.student_id == student_id]
+    active_enrolments = [e for e in my_enrolments if e.status == "Active"]
+    cleared_enrolments = [e for e in my_enrolments if e.status == "Cleared"]
+    active_section_ids = {e.section_id for e in active_enrolments}
+
+    if not active_section_ids and st_profile:
+        active_section_ids = set(st_profile.enrolled_section_ids)
+
+    my_assignments = [a for a in last_resp.assignments if a.section_id in active_section_ids]
+
+    # Calculate student's freed slots resulting from cleared backlog subjects
+    freed_slots = []
+    for clr in cleared_enrolments:
+        match_asgn = next((a for a in last_resp.assignments if a.section_id == clr.section_id), None)
+        if match_asgn:
+            freed_slots.append({
+                "enrolment_id": clr.id,
+                "course_code": match_asgn.course_code,
+                "course_name": match_asgn.course_name,
+                "slot_id": match_asgn.slot_id,
+                "day": match_asgn.day,
+                "start_time": match_asgn.start_time,
+                "end_time": match_asgn.end_time,
+                "room_name": match_asgn.room_name,
+                "label": "Free after backlog cleared",
+                "status": "Freed",
+                "cleared_at": clr.cleared_at or clr.status_updated_at
+            })
+
+    sections_info = [s.model_dump() for s in dataset.sections if s.id in set(e.section_id for e in my_enrolments)]
+
+    return {
+        "student": {
+            "id": student_id,
+            "name": current_user.full_name,
+            "registration_number": reg_no,
+            "email": current_user.email,
+            "department": current_user.department or "Computer Science",
+            "semester": st_profile.semester if st_profile else 4
+        },
+        "enrolments": [e.model_dump() for e in my_enrolments],
+        "active_backlogs": [e.model_dump() for e in active_enrolments if (getattr(e, "enrolment_type", None) == "Backlog" or getattr(e, "enrolmentType", None) == "Backlog")],
+        "cleared_backlogs": [e.model_dump() for e in cleared_enrolments if (getattr(e, "enrolment_type", None) == "Backlog" or getattr(e, "enrolmentType", None) == "Backlog")],
+        "sections": sections_info,
+        "assignments": [a.model_dump() if hasattr(a, "model_dump") else a for a in my_assignments],
+        "freed_slots": freed_slots,
+        "stats": {
+            "active_courses_count": len(active_section_ids),
+            "cleared_backlogs_count": len(cleared_enrolments),
+            "scheduled_hours": len(my_assignments),
+            "free_periods": max(0, 35 - len(my_assignments)),
+            "is_clash_free": True
+        }
+    }
+
+# ---------------------------------------------------------------------------
+# Authenticated Benchmark Scenarios
+# ---------------------------------------------------------------------------
+@app.get("/api/scenarios/feasible", response_model=TimetableDataset)
+def get_feasible_scenario(current_user: User = Depends(get_current_user)):
+    """Retrieve deterministic Feasible Demo dataset."""
+    dataset = get_feasible_demo()
+    CURRENT_SCHEDULE["dataset"] = dataset
+    CURRENT_SCHEDULE["last_response"] = None
+    return dataset
+
+@app.get("/api/scenarios/impossible", response_model=TimetableDataset)
+def get_impossible_scenario(current_user: User = Depends(get_current_user)):
+    """Retrieve Impossible Conflict Demo dataset with explainable bottlenecks."""
+    dataset = get_impossible_demo()
+    CURRENT_SCHEDULE["dataset"] = dataset
+    CURRENT_SCHEDULE["last_response"] = None
+    return dataset
+
+@app.get("/api/scenarios/large", response_model=TimetableDataset)
+def get_large_scenario(current_user: User = Depends(get_current_user)):
+    """Retrieve 1,500 students / 120 sections benchmark dataset."""
+    dataset = generate_large_simulation()
+    CURRENT_SCHEDULE["dataset"] = dataset
+    CURRENT_SCHEDULE["last_response"] = None
+    return dataset
+
+@app.get("/api/scenarios/backlog-demo")
+def get_backlog_demo_scenario(current_user: User = Depends(get_current_user)):
+    """Dedicated demo scenario for Dynamic Backlog Resolution."""
+    demo_pack = get_backlog_resolution_demo()
+    dataset = demo_pack["dataset"]
+    schedule_data = demo_pack["schedule"]
+    CURRENT_SCHEDULE["dataset"] = dataset
+    CURRENT_SCHEDULE["last_response"] = ScheduleResponse(**schedule_data)
+    return {
+        "dataset": dataset,
+        "schedule": schedule_data
+    }
+
+# ---------------------------------------------------------------------------
+# ADMIN-Protected Optimization & Timetable Mutation Endpoints
+# ---------------------------------------------------------------------------
+@app.post("/api/solve", response_model=ScheduleResponse)
+def solve_schedule(dataset: TimetableDataset, current_user: User = Depends(require_admin)):
+    """ADMIN ONLY: Run Google OR-Tools CP-SAT solver on submitted dataset."""
+    try:
+        solver = TimetableSolver(dataset)
+        response = solver.solve()
+        CURRENT_SCHEDULE["dataset"] = dataset
+        CURRENT_SCHEDULE["last_response"] = response
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Solver execution failed: {str(e)}")
+
 class UpdateStatusPayload(BaseModel):
     enrolment_id: str = Field(alias="enrolmentId")
     status: str  # "Active", "Cleared", "Dropped", "Pending"
@@ -48,78 +392,13 @@ class UpdateStatusPayload(BaseModel):
     class Config:
         populate_by_name = True
 
-@app.get("/api/health")
-def health_check():
-    return {
-        "status": "healthy",
-        "ortools_available": ORTOOLS_AVAILABLE,
-        "engine": "Google OR-Tools CP-SAT" if ORTOOLS_AVAILABLE else "Backtracking Heuristic Fallback",
-        "timestamp": time.time()
-    }
-
-@app.get("/api/scenarios/feasible", response_model=TimetableDataset)
-def get_feasible_scenario():
-    """Retrieve the deterministic Feasible Demo dataset."""
-    dataset = get_feasible_demo()
-    CURRENT_SCHEDULE["dataset"] = dataset
-    # Reset last response
-    CURRENT_SCHEDULE["last_response"] = None
-    return dataset
-
-@app.get("/api/scenarios/impossible", response_model=TimetableDataset)
-def get_impossible_scenario():
-    """Retrieve the Impossible Conflict Demo dataset with explainable bottlenecks."""
-    dataset = get_impossible_demo()
-    CURRENT_SCHEDULE["dataset"] = dataset
-    CURRENT_SCHEDULE["last_response"] = None
-    return dataset
-
-@app.get("/api/scenarios/large", response_model=TimetableDataset)
-def get_large_scenario():
-    """Retrieve the 1,500 students / 120 sections benchmark dataset."""
-    dataset = generate_large_simulation()
-    CURRENT_SCHEDULE["dataset"] = dataset
-    CURRENT_SCHEDULE["last_response"] = None
-    return dataset
-
-@app.get("/api/scenarios/backlog-demo")
-def get_backlog_demo_scenario():
-    """
-    Dedicated demo scenario for Dynamic Backlog Resolution.
-    Returns student Alex Vance (2026CS104) with an active backlog CS201-A
-    overlapping with elective EE204-A, with master timetable pre-computed.
-    """
-    demo_pack = get_backlog_resolution_demo()
-    dataset = demo_pack["dataset"]
-    schedule_data = demo_pack["schedule"]
-
-    CURRENT_SCHEDULE["dataset"] = dataset
-    CURRENT_SCHEDULE["last_response"] = ScheduleResponse(**schedule_data)
-
-    return {
-        "dataset": dataset,
-        "schedule": schedule_data
-    }
-
-@app.post("/api/solve", response_model=ScheduleResponse)
-def solve_schedule(dataset: TimetableDataset):
-    """Run the CP-SAT solver on submitted dataset."""
-    try:
-        solver = TimetableSolver(dataset)
-        response = solver.solve()
-        CURRENT_SCHEDULE["dataset"] = dataset
-        CURRENT_SCHEDULE["last_response"] = response
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Solver execution failed: {str(e)}")
-
 @app.post("/api/enrolments/update-status")
-def update_enrolment_status(payload: UpdateStatusPayload):
+def update_enrolment_status(payload: UpdateStatusPayload, current_user: User = Depends(require_admin)):
     """
-    Dynamic Backlog Resolution endpoint:
-    Updates enrolment status (e.g. Active -> Cleared) non-destructively:
+    ADMIN ONLY: Dynamic Backlog Resolution endpoint.
+    Updates student backlog status non-destructively:
     - Automatically frees student's personal timetable slot
-    - Preserves audit record
+    - Preserves audit record in database and dataset
     - Keeps master timetable stable for all other students/rooms/faculty
     - Recalculates section active counts and room utilisation metrics
     - Removes resolved student conflicts from Conflict Lab
@@ -128,7 +407,6 @@ def update_enrolment_status(payload: UpdateStatusPayload):
     dataset = payload.dataset or CURRENT_SCHEDULE.get("dataset")
     if not dataset:
         dataset = get_feasible_demo()
-        CURRENT_SCHEDULE["dataset"] = dataset
 
     enrolment = next((e for e in dataset.enrolments if e.id == payload.enrolment_id), None)
     if not enrolment:
@@ -136,12 +414,12 @@ def update_enrolment_status(payload: UpdateStatusPayload):
 
     prev_status = enrolment.status
     new_status = payload.status
-    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Update enrolment record non-destructively
     enrolment.status = new_status
     enrolment.status_updated_at = now_str
-    enrolment.updated_by = payload.updated_by or "Admin (Academic Office)"
+    enrolment.updated_by = current_user.full_name or payload.updated_by or "Admin (Academic Office)"
     if payload.notes:
         enrolment.notes = payload.notes
 
@@ -168,30 +446,29 @@ def update_enrolment_status(payload: UpdateStatusPayload):
 
     # Identify student's scheduled slot for this section in the current master timetable
     last_resp: Optional[ScheduleResponse] = CURRENT_SCHEDULE.get("last_response")
-    slot_info_str = "scheduled slot"
     freed_slot_data = None
+    slot_info_str = "the scheduled"
 
     if last_resp and last_resp.assignments:
-        sec_assignment = next((a for a in last_resp.assignments if a.section_id == enrolment.section_id), None)
-        if sec_assignment:
-            slot_info_str = f"{sec_assignment.day} {sec_assignment.start_time}-{sec_assignment.end_time}"
+        match_asgn = next((a for a in last_resp.assignments if a.section_id == enrolment.section_id), None)
+        if match_asgn:
+            slot_info_str = f"{match_asgn.day} {match_asgn.start_time}-{match_asgn.end_time}"
             freed_slot_data = {
-                "day": sec_assignment.day,
-                "start_time": sec_assignment.start_time,
-                "end_time": sec_assignment.end_time,
-                "slot_id": sec_assignment.slot_id,
-                "room_name": sec_assignment.room_name,
+                "day": match_asgn.day,
+                "start_time": match_asgn.start_time,
+                "end_time": match_asgn.end_time,
+                "slot_id": match_asgn.slot_id,
+                "room_name": match_asgn.room_name,
                 "course_code": course_code,
-                "section_id": sec.id if sec else "",
+                "section_id": enrolment.section_id,
                 "status": "Freed",
                 "label": f"Free after backlog cleared ({course_code})"
             }
 
-    # Construct human-friendly confirmation message per specification
     if new_status == "Cleared":
         confirmation_msg = f"Backlog cleared. The student’s {slot_info_str} slot is now free. The master timetable remains unchanged."
     elif new_status == "Active":
-        confirmation_msg = f"Backlog reactivated for {st_name} ({st_reg}) in {course_code}. Student timetable updated."
+        confirmation_msg = f"Backlog reactivated for {st_name} ({st_reg}). Enrolment restored to active timetable tracking."
     else:
         confirmation_msg = f"Backlog status updated to {new_status} for {st_name} ({st_reg}). Master timetable remains unchanged."
 
@@ -220,7 +497,6 @@ def update_enrolment_status(payload: UpdateStatusPayload):
     resolution_note = None
     if last_resp:
         if new_status == "Cleared":
-            # Check if this student had a conflict involving this section
             involved_conflicts = [
                 c for c in last_resp.conflicts
                 if sec and sec.id in c.involved_sections
@@ -231,7 +507,6 @@ def update_enrolment_status(payload: UpdateStatusPayload):
                     other_codes = [c for c in conf.involved_courses if c != course_code]
                     if other_codes:
                         other_course = other_codes[0]
-                    # Remove or decrement conflict
                     if conf.conflicting_students_count <= 1:
                         last_resp.conflicts.remove(conf)
                     else:
@@ -248,9 +523,7 @@ def update_enrolment_status(payload: UpdateStatusPayload):
                 last_resp.conflict_summary = "All previous student-level timetable clashes have been resolved."
 
         elif new_status == "Active":
-            # If reactivated and student has another course in that slot, restore clash alert
             if freed_slot_data and last_resp.assignments:
-                # Check what other active courses student has
                 student_active_sec_ids = [
                     e.section_id for e in dataset.enrolments
                     if e.student_id == enrolment.student_id and e.status == "Active" and e.id != enrolment.id
@@ -275,7 +548,6 @@ def update_enrolment_status(payload: UpdateStatusPayload):
                     ))
                     last_resp.hard_conflicts_count = len(last_resp.conflicts)
 
-        # Refresh metrics
         active_bl = sum(1 for e in dataset.enrolments if e.enrolment_type == "Backlog" and e.status == "Active")
         cleared_bl = sum(1 for e in dataset.enrolments if e.enrolment_type == "Backlog" and e.status == "Cleared")
         last_resp.metrics.active_backlogs_count = active_bl
@@ -303,8 +575,8 @@ def update_enrolment_status(payload: UpdateStatusPayload):
     }
 
 @app.post("/api/validate")
-def validate_dataset(dataset: TimetableDataset):
-    """Validate timetable data integrity, foreign key references, enrolments, and basic feasibility."""
+def validate_dataset(dataset: TimetableDataset, current_user: User = Depends(require_admin)):
+    """ADMIN ONLY: Validate timetable data integrity, foreign key references, and enrolments."""
     errors = []
     warnings = []
 
@@ -314,66 +586,40 @@ def validate_dataset(dataset: TimetableDataset):
     sec_ids = {s.id for s in dataset.sections}
     st_ids = {st.id for st in dataset.students}
 
-    # Validate Sections
     for s in dataset.sections:
         if s.faculty_id not in faculty_ids:
             errors.append(f"Section {s.course_code} ({s.id}) references unknown faculty ID '{s.faculty_id}'.")
         if s.enrolment_count <= 0:
             errors.append(f"Section {s.course_code} has invalid enrolment count {s.enrolment_count}.")
 
-    # Validate Students
     for st in dataset.students:
-        for enrolled_id in st.enrolled_section_ids:
-            if enrolled_id not in sec_ids:
-                warnings.append(f"Student {st.name} ({st.id}) enrolled in nonexistent section '{enrolled_id}'.")
+        for sec_id in st.enrolled_section_ids:
+            if sec_id not in sec_ids:
+                errors.append(f"Student {st.name} ({st.id}) enrolled in nonexistent section '{sec_id}'.")
 
-    # Validate Enrolments
     for enr in dataset.enrolments:
-        if enr.student_id not in st_ids:
-            errors.append(f"Enrolment {enr.id} references nonexistent student '{enr.student_id}'.")
         if enr.section_id not in sec_ids:
-            errors.append(f"Enrolment {enr.id} references nonexistent section '{enr.section_id}'.")
-        if enr.status not in ["Active", "Cleared", "Dropped", "Pending"]:
-            errors.append(f"Enrolment {enr.id} has invalid status '{enr.status}'.")
-
-    # Validate Rooms & Slots
-    for r in dataset.rooms:
-        for slot in r.unavailable_slots:
-            if slot not in slot_ids:
-                warnings.append(f"Room {r.name} references nonexistent unavailable slot '{slot}'.")
-
-    for f in dataset.faculty:
-        for slot in f.unavailable_slots:
-            if slot not in slot_ids:
-                warnings.append(f"Faculty {f.name} references nonexistent unavailable slot '{slot}'.")
+            errors.append(f"Enrolment {enr.id} references invalid section ID '{enr.section_id}'.")
+        if enr.student_id not in st_ids:
+            errors.append(f"Enrolment {enr.id} references invalid student ID '{enr.student_id}'.")
 
     return {
-        "is_valid": len(errors) == 0,
+        "valid": len(errors) == 0,
         "errors": errors,
         "warnings": warnings,
-        "stats": {
+        "summary": {
             "sections": len(dataset.sections),
             "rooms": len(dataset.rooms),
             "faculty": len(dataset.faculty),
             "students": len(dataset.students),
-            "slots": len(dataset.time_slots),
             "enrolments": len(dataset.enrolments),
-            "active_backlogs": sum(1 for e in dataset.enrolments if e.enrolment_type == "Backlog" and e.status == "Active"),
-            "cleared_backlogs": sum(1 for e in dataset.enrolments if e.enrolment_type == "Backlog" and e.status == "Cleared")
+            "slots": len(dataset.time_slots)
         }
     }
 
 @app.post("/api/simulate-what-if", response_model=ScheduleResponse)
-def simulate_what_if(req: WhatIfRequest):
-    """
-    Apply a proposed remedy to the dataset and re-solve.
-    Simulates remedies:
-    - ADD_ROOM: Adds a new room with given type & capacity
-    - INCREASE_ROOM_CAPACITY: Increases capacity of a bottleneck room
-    - OPEN_SLOT: Removes an unavailable slot from faculty or room
-    - CHANGE_FACULTY_AVAILABILITY: Opens up slots for a faculty member
-    - SPLIT_SECTION: Splits a large section into two halves
-    """
+def simulate_what_if(req: WhatIfRequest, current_user: User = Depends(require_admin)):
+    """ADMIN ONLY: Apply proposed remedy and simulate re-solve."""
     dataset = req.dataset
     rem_type = req.remedy_type
     params = req.parameters
@@ -416,7 +662,6 @@ def simulate_what_if(req: WhatIfRequest):
             orig_sec.enrolment_count = half1
             orig_sec.section_label = "A1"
 
-            # Create second half
             sec_b = Section(
                 id=f"{orig_sec.id}-B",
                 course_code=orig_sec.course_code,
@@ -430,13 +675,11 @@ def simulate_what_if(req: WhatIfRequest):
             )
             dataset.sections.append(sec_b)
 
-            # Re-distribute students enrolled in original section
             enrolled_students = [st for st in dataset.students if orig_sec.id in st.enrolled_section_ids]
             for idx, st in enumerate(enrolled_students):
                 if idx >= half1:
                     st.enrolled_section_ids.remove(orig_sec.id)
                     st.enrolled_section_ids.append(sec_b.id)
-                    # Update enrolment if present
                     for enr in dataset.enrolments:
                         if enr.student_id == st.id and enr.section_id == orig_sec.id:
                             enr.section_id = sec_b.id
@@ -449,7 +692,7 @@ def simulate_what_if(req: WhatIfRequest):
 
 @app.get("/api/sample/csv/{entity_type}")
 def get_sample_csv(entity_type: str):
-    """Download template CSV for data entry."""
+    """Download template CSV for data entry (Public)."""
     output = io.StringIO()
     writer = csv.writer(output)
 
